@@ -182,7 +182,7 @@ def make_prober(fake_dns, demo_certs):
     _cert, _key, cafile = demo_certs
 
     def _factory(allowed=("127.0.0.1/32",), max_redirects: int = 3,
-                 read_timeout: float = 5.0) -> Prober:
+                 read_timeout: float = 5.0, breaker=None) -> Prober:
         settings = Settings(
             policy=AddressPolicy.from_cidrs(list(allowed)),
             dns_server="127.0.0.1",
@@ -196,6 +196,8 @@ def make_prober(fake_dns, demo_certs):
             max_redirects=max_redirects,
             max_concurrency=8,
             overall_timeout=20.0,
+            breaker_threshold=3,
+            breaker_cooldown=30.0,
         )
         resolver = DnsResolver("127.0.0.1", port=fake_dns.port, retries=0)
         return Prober(
@@ -206,6 +208,7 @@ def make_prober(fake_dns, demo_certs):
             read_timeout=read_timeout,
             tls_timeout=5.0,
             max_redirects=max_redirects,
+            breaker=breaker,
         )
 
     return _factory

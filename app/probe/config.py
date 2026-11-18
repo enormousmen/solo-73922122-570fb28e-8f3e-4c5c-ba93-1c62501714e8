@@ -22,6 +22,8 @@ class Settings:
     max_redirects: int
     max_concurrency: int
     overall_timeout: float
+    breaker_threshold: int
+    breaker_cooldown: float
 
     @property
     def allowed_cidrs(self) -> list[str]:
@@ -44,6 +46,13 @@ def load_settings() -> Settings:
     if ca_bundle is not None and not os.path.isfile(ca_bundle):
         raise SystemExit(f"启动失败: CA_BUNDLE 文件不存在: {ca_bundle}")
 
+    breaker_threshold = int(os.getenv("BREAKER_THRESHOLD", "3"))
+    if breaker_threshold < 1:
+        raise SystemExit("启动失败: BREAKER_THRESHOLD 必须 >= 1")
+    breaker_cooldown = float(os.getenv("BREAKER_COOLDOWN", "30.0"))
+    if breaker_cooldown <= 0:
+        raise SystemExit("启动失败: BREAKER_COOLDOWN 必须 > 0（秒）")
+
     return Settings(
         policy=policy,
         dns_server=os.getenv("DNS_SERVER", "127.0.0.1").strip(),
@@ -57,4 +66,6 @@ def load_settings() -> Settings:
         max_redirects=max_redirects,
         max_concurrency=int(os.getenv("MAX_CONCURRENCY", "64")),
         overall_timeout=float(os.getenv("PROBE_OVERALL_TIMEOUT", "30.0")),
+        breaker_threshold=breaker_threshold,
+        breaker_cooldown=breaker_cooldown,
     )

@@ -13,6 +13,7 @@
     "loop3.demo.test":          ["172.31.10.10"],
     "loop4.demo.test":          ["172.31.10.10"],
     "forbidden.demo.test":      ["172.31.20.10"],
-    "swapped.demo.test":        ["172.31.20.10"]
+    "swapped.demo.test":        ["172.31.20.10"],
+    "flaky.demo.test":          ["172.31.10.10"]
   }
 }

@@ -81,6 +81,38 @@ probe_url "IPv6 字面量：拒绝" "http://[2001:db8::1]/"
 probe_url "非 HTTP(S) scheme：拒绝" "ftp://allowed.demo.test${HPORT}/"
 probe_url "URL 携带 userinfo：拒绝" "http://u:p@allowed.demo.test${HPORT}/"
 
+# 7) 熔断：可控故障目标 flaky.demo.test:8899（故障模式由目标 /_fault 热切换）
+FAULT_CTRL="${FAULT_CTRL:-http://127.0.0.1:${TARGET_REQ_PORT}/_fault}"
+FAULT_URL="http://flaky.demo.test:8899/"
+BREAKER_WAIT="${BREAKER_WAIT:-31}"
+
+fault_mode() {
+  local mode="$1"
+  echo "--- 切换故障目标模式 -> ${mode}"
+  curl -sS -X POST "${FAULT_CTRL}" \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg m "$mode" '{mode:$m}')" | jq -c .
+}
+
+echo
+echo "### 7. 进程内熔断（同一 主机名+端口 连续 3 次故障后冷却）"
+fault_mode closed   # 目标端口关闭：连接被拒绝
+for i in 1 2 3; do
+  probe_url "故障探测第 ${i} 次（连接失败，计入熔断）" "${FAULT_URL}"
+done
+probe_url "第 4 次：熔断冷却中，直接报告剩余时间（不解析、不连接）" "${FAULT_URL}"
+
+echo "--- 当前熔断状态（GET /api/v1/breakers）:"
+curl -sS "${BASE}/api/v1/breakers" | jq .
+
+fault_mode ok       # 目标已恢复，但冷却期内的请求仍被拦
+probe_url "目标已恢复但冷却未到期：仍被熔断拦截" "${FAULT_URL}"
+
+echo "--- 等待冷却到期（${BREAKER_WAIT}s）..."
+sleep "${BREAKER_WAIT}"
+probe_url "冷却到期：唯一试探成功，熔断清零自动放行" "${FAULT_URL}"
+probe_url "再次探测：已恢复正常" "${FAULT_URL}"
+
 echo
 echo "### 验证禁止目标从未收到探测请求（应返回空列表）:"
 curl -sS "http://127.0.0.1:${TARGET_REQ_PORT}/_requests" \

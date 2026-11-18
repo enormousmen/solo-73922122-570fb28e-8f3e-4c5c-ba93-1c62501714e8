@@ -44,6 +44,9 @@ services:
       DNS_PROFILES_DIR: /app/dns-profiles
       DNS_STATE_FILE: /tmp/dns-state/profile
       DNS_CONTROL_PORT: "8053"
+    ports:
+      # 控制面仅绑定本机回环，供演示脚本热切换 profile
+      - "127.0.0.1:8053:8053"
     volumes:
       - ./dns-profiles:/app/dns-profiles:ro
       - dns-state:/tmp/dns-state
@@ -55,11 +58,17 @@ services:
         condition: service_completed_successfully
 
   # 允许访问的目标：HTTP/8080 + HTTPS/8443
+  # 同时运行可控故障监听（FAULT_PORT=8899，可用 /_fault 热切换
+  # ok / timeout / closed，用于演示探测端熔断与恢复）
   target-allowed:
     build: .
     command: ["python", "-m", "app.targets.server"]
     environment:
       CERT_DIR: /app/certs
+      FAULT_PORT: "8899"
+    ports:
+      # 控制面（/_requests、/_fault）仅绑定本机回环
+      - "127.0.0.1:8080:8080"
     volumes:
       - certs:/app/certs:ro
     networks:
@@ -98,6 +107,10 @@ services:
       MAX_REDIRECTS: "3"
       MAX_CONCURRENCY: "64"
       PROBE_OVERALL_TIMEOUT: "30.0"
+      # 进程内熔断：同一 (主机名, 端口) 连续 3 次全部地址连接失败或
+      # 读取超时后冷却 30 秒；到期仅放行一笔试探
+      BREAKER_THRESHOLD: "3"
+      BREAKER_COOLDOWN: "30.0"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

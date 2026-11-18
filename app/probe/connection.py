@@ -17,6 +17,14 @@ from dataclasses import dataclass
 from .policy import PolicyError
 
 
+class CertVerificationError(PolicyError):
+    """TLS 证书校验失败。
+
+    单独成类是为了让熔断分类能把它与其他连接失败区分开：
+    证书校验失败不计入熔断故障（见 breaker.COUNTABLE_KINDS）。
+    """
+
+
 @dataclass
 class TlsInfo:
     version: str
@@ -78,7 +86,7 @@ async def start_tls(
         raise PolicyError(f"TLS 握手超时（域名 {hostname}）") from exc
     except ssl.SSLCertVerificationError as exc:
         # 证书/主机名校验失败：明确告知，且不提供任何“跳过校验”的选项
-        raise PolicyError(
+        raise CertVerificationError(
             f"TLS 证书校验失败（按原域名 {hostname!r} 验证，未关闭校验）: "
             f"{exc.verify_message or exc}"
         ) from exc

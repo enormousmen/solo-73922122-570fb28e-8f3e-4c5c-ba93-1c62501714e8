@@ -10,6 +10,13 @@
 * DNS 在检查后变化、连接重试、HTTP 跳转都不会让请求进入未获准网段；
 * 被策略拒绝的目标在任何 socket 建立之前就被拦下，收不到探测请求；
 * 每跳最多把已批准的地址各试一次，重试绝不重新解析 DNS。
+
+熔断（可选，由 main 注入 CircuitBreaker）：
+* 每跳在 URL 静态校验之后、DNS 解析之前做熔断准入判定；
+  熔断中的目标直接报告 circuit_open 与剩余冷却时间，不解析、不连接；
+* 逐跳按 (规范化主机名, 端口) 各自计数：全部已批准地址均连接失败或
+  读取超时记一次故障；策略拒绝与证书校验失败不计；
+* 跳转各跳独立计数，已发出请求的跳在报告中保留 request_sent 等事实。
 """
 
 from __future__ import annotations
@@ -20,7 +27,14 @@ import ssl
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urljoin, urlsplit
 
-from .connection import TlsInfo, build_ssl_context, open_tcp, start_tls
+from .breaker import COUNTABLE_KINDS, Admission, CircuitBreaker
+from .connection import (
+    CertVerificationError,
+    TlsInfo,
+    build_ssl_context,
+    open_tcp,
+    start_tls,
+)
 from .dns_client import DnsError, DnsResolver
 from .policy import (
     AddressPolicy,
@@ -51,17 +65,41 @@ class HopReport:
     reason: str | None = None
     location: str | None = None
     redirect_count: int = 0
-    outcome: str = "pending"  # ok | redirected | blocked | error
+    outcome: str = "pending"  # ok | redirected | blocked | error | circuit_open
     reject_reason: str | None = None
     error: str | None = None
+    # 故障分类（供熔断计数）：connect / read_timeout 计入熔断；
+    # cert（证书校验失败）/ other 不计；blocked 跳保持 None。
+    failure_kind: str | None = None
+    circuit_retry_after_ms: int | None = None
 
     def mark_blocked(self, reason: str) -> None:
         self.outcome = "blocked"
         self.reject_reason = reason
         self.reason = reason
 
-    def mark_error(self, message: str) -> None:
+    def mark_error(self, message: str, failure_kind: str | None = None) -> None:
         self.outcome = "error"
+        self.error = message
+        self.reason = message
+        if failure_kind is not None:
+            self.failure_kind = failure_kind
+
+    def mark_circuit_open(self, admission: Admission, key_host: str) -> None:
+        """熔断拦截：本跳未解析、未连接，直接报告熔断状态与剩余时间。"""
+        self.outcome = "circuit_open"
+        self.circuit_retry_after_ms = admission.retry_after_ms
+        if admission.state == "half_open":
+            message = (
+                f"目标 {key_host}:{self.port} 熔断恢复试探进行中，"
+                "本次请求被拦截（未解析、未连接），请稍后重试"
+            )
+        else:
+            secs = (admission.retry_after_ms or 0) / 1000
+            message = (
+                f"目标 {key_host}:{self.port} 处于熔断冷却期，"
+                f"剩余约 {secs:.1f} 秒；本次请求未解析、未连接"
+            )
         self.error = message
         self.reason = message
 
@@ -77,6 +115,7 @@ class Prober:
         tls_timeout: float = 8.0,
         max_redirects: int = MAX_REDIRECTS,
         max_bytes: int = MAX_BYTES,
+        breaker: CircuitBreaker | None = None,
     ) -> None:
         self._policy = policy
         self._resolver = resolver
@@ -86,6 +125,7 @@ class Prober:
         self._tls_timeout = tls_timeout
         self._max_redirects = max_redirects
         self._max_bytes = max_bytes
+        self._breaker = breaker
 
     async def probe(self, url: str, method: str = "GET") -> list[HopReport]:
         method = method.upper()
@@ -99,7 +139,7 @@ class Prober:
             hop = HopReport(hop=hop_idx, url=current, scheme="", hostname="", port=0)
             hops.append(hop)
             next_url = await self._do_hop(hop, current, method)
-            if hop.outcome in ("blocked", "error"):
+            if hop.outcome in ("blocked", "error", "circuit_open"):
                 return hops
             if next_url is None:
                 hop.outcome = "ok"
@@ -135,7 +175,49 @@ class Prober:
         hop.hostname = host
         hop.port = port or DEFAULT_PORTS[scheme]
 
-        # 2) 解析 + 白名单：IP 字面量直接校验；域名只问配置的解析器
+        # 2) 熔断准入：在 DNS 解析与任何连接之前判定；
+        #    熔断中的目标直接报告，不产生任何流量
+        admission: Admission | None = None
+        if self._breaker is not None:
+            admission = self._breaker.admit(host, hop.port)
+            if not admission.admitted:
+                hop.mark_circuit_open(admission, host)
+                return None
+
+        try:
+            next_url = await self._do_hop_network(hop, scheme, host, method, url)
+        except asyncio.CancelledError:
+            # 客户端断开或单请求总超时：试探取消必须重新冷却
+            if admission is not None:
+                self._breaker.record_cancelled(host, hop.port, admission)
+            raise
+        except Exception:
+            # 异常逃逸（实现缺陷等）：按“未收到响应”回执，避免试探卡死半开
+            if admission is not None:
+                self._breaker.record_neutral(host, hop.port, admission)
+            raise
+        if admission is not None:
+            self._record_hop_outcome(host, hop, admission)
+        return next_url
+
+    def _record_hop_outcome(
+        self, host: str, hop: HopReport, admission: Admission
+    ) -> None:
+        """把本跳结果回执给熔断器（每个准入令牌恰好一次）。"""
+        assert self._breaker is not None
+        if hop.status_code is not None:
+            # 收到 HTTP 响应（含 3xx/4xx/5xx）：目标可达，清零
+            self._breaker.record_success(host, hop.port, admission)
+        elif hop.failure_kind in COUNTABLE_KINDS:
+            self._breaker.record_failure(host, hop.port, admission)
+        else:
+            # 策略拒绝、证书校验失败、其他协议/读写错误：不计故障
+            self._breaker.record_neutral(host, hop.port, admission)
+
+    async def _do_hop_network(
+        self, hop: HopReport, scheme: str, host: str, method: str, url: str
+    ) -> str | None:
+        # 3) 解析 + 白名单：IP 字面量直接校验；域名只问配置的解析器
         try:
             if is_ip_literal(host):
                 resolved = [host]
@@ -145,13 +227,15 @@ class Prober:
             approved = self._policy.check_resolved(resolved)
             hop.approved_addresses = [str(ip) for ip in approved]
         except (PolicyError, DnsError) as exc:
+            # 策略拒绝 / DNS 失败：不计熔断故障（failure_kind 保持 None）
             hop.mark_blocked(str(exc))
             return None
 
-        # 3) 仅对已批准地址尝试连接，每个地址一次，绝不重新解析
+        # 4) 仅对已批准地址尝试连接，每个地址一次，绝不重新解析
+        kinds: list[str] = []
         last_err: str | None = None
         for ip in approved:
-            connected = await self._try_one_address(hop, ip, scheme, host, method)
+            connected, kind = await self._try_one_address(hop, ip, scheme, host)
             if connected is not None:
                 # 该地址连接成功：清除此前地址尝试留下的错误，避免残留
                 hop.error = None
@@ -162,8 +246,8 @@ class Prober:
                     )
                 except PolicyError as exc:
                     # 响应阶段的策略性错误（如响应头超限、非法状态行）：
-                    # 记录为本跳错误，不逃逸到 API 入口
-                    hop.mark_error(str(exc))
+                    # 记录为本跳错误，不逃逸到 API 入口；不计熔断故障
+                    hop.mark_error(str(exc), failure_kind="other")
                     return None
                 finally:
                     writer.close()
@@ -171,13 +255,31 @@ class Prober:
                         await writer.wait_closed()
                     except (OSError, ssl.SSLError):
                         pass
+            kinds.append(kind)
             last_err = hop.error or hop.reject_reason
         # 所有已批准地址均连接失败
-        hop.mark_error(f"全部已批准地址连接失败（未尝试任何未获准地址）: {last_err}")
+        hop.mark_error(
+            f"全部已批准地址连接失败（未尝试任何未获准地址）: {last_err}",
+            failure_kind=self._classify_connect_failures(kinds),
+        )
         return None
 
-    async def _try_one_address(self, hop, ip: ipaddress.IPv4Address,
-                               scheme: str, host: str, method: str):
+    @staticmethod
+    def _classify_connect_failures(kinds: list[str]) -> str:
+        """全部地址失败后的整跳分类。
+
+        只有“每个地址都是连接类失败”才计入熔断；只要混入证书校验失败，
+        整跳即不计故障（证书问题需要修证书，不应按目标宕机熔断）。
+        """
+        if kinds and all(k == "connect" for k in kinds):
+            return "connect"
+        if kinds and all(k == "cert" for k in kinds):
+            return "cert"
+        return "other"
+
+    async def _try_one_address(self, hop: HopReport, ip: ipaddress.IPv4Address,
+                               scheme: str, host: str):
+        """尝试单个已批准地址，返回 (连接元组 | None, 失败分类 | None)。"""
         try:
             reader, writer, peer = await open_tcp(
                 ip, hop.port, self._connect_timeout
@@ -188,13 +290,19 @@ class Prober:
                     writer, reader, host, self._ssl, self._tls_timeout
                 )
                 hop.tls = asdict(tls_info)
-            return reader, writer, tls_info if scheme == "https" else None
-        except PolicyError as exc:
-            # 记录失败原因后继续试下一个 *已批准* 地址
+            return (reader, writer, tls_info if scheme == "https" else None), None
+        except CertVerificationError as exc:
+            # 证书校验失败：不计熔断故障
             hop.connected_peer = None
             hop.tls = None
             hop.error = str(exc)
-            return None
+            return None, "cert"
+        except PolicyError as exc:
+            # TCP/TLS 建连失败：记录失败原因后继续试下一个 *已批准* 地址
+            hop.connected_peer = None
+            hop.tls = None
+            hop.error = str(exc)
+            return None, "connect"
 
     async def _send_and_read(
         self, hop: HopReport, reader, writer, method: str,
@@ -224,10 +332,15 @@ class Prober:
                 self._read_response(reader), timeout=self._read_timeout
             )
         except asyncio.TimeoutError as exc:
-            hop.mark_error(f"读取响应超时（{self._read_timeout}s）")
+            # 读取超时计入熔断故障
+            hop.mark_error(
+                f"读取响应超时（{self._read_timeout}s）",
+                failure_kind="read_timeout",
+            )
             return None
         except OSError as exc:
-            hop.mark_error(f"连接读写错误: {exc}")
+            # 读写中的连接错误：目标可达但会话异常，不计熔断故障
+            hop.mark_error(f"连接读写错误: {exc}", failure_kind="other")
             return None
 
         hop.status_code = response["status"]

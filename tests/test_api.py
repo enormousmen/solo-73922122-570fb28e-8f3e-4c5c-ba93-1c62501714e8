@@ -123,6 +123,8 @@ def client(monkeypatch, demo_certs):
         monkeypatch.setenv("READ_TIMEOUT", "5.0")
         monkeypatch.setenv("TLS_TIMEOUT", "5.0")
         monkeypatch.setenv("PROBE_OVERALL_TIMEOUT", "15.0")
+        monkeypatch.setenv("BREAKER_THRESHOLD", "3")
+        monkeypatch.setenv("BREAKER_COOLDOWN", "30.0")
 
         import app.probe.config as config_mod
         import app.probe.dns_client as dns_client_mod
@@ -212,3 +214,77 @@ def test_probe_bad_method_422(client):
 def test_openapi_docs_available(client):
     assert client.get("/openapi.json").status_code == 200
     assert client.get("/docs").status_code == 200
+
+
+def _unused_port() -> int:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_policy_endpoint_includes_breaker(client):
+    body = client.get("/api/v1/policy").json()
+    assert body["breaker"]["threshold"] == 3
+    assert body["breaker"]["cooldown_seconds"] == 30.0
+    assert body["breaker"]["counted_failures"] == ["connect", "read_timeout"]
+
+
+def test_breakers_endpoint_initially_empty(client):
+    body = client.get("/api/v1/breakers").json()
+    assert body["threshold"] == 3
+    assert body["cooldown_seconds"] == 30.0
+    assert body["circuits"] == []
+
+
+def test_circuit_opens_after_connect_failures(client):
+    port = _unused_port()  # 无服务监听：连接被拒绝
+    client._dns.zones = {"api-dead.test": ["127.0.0.1"]}
+    url = f"http://api-dead.test:{port}/"
+
+    for _ in range(3):
+        body = client.post("/api/v1/probe", json={"url": url}).json()
+        assert body["outcome"] == "error"
+        assert body["hops"][-1]["failure_kind"] == "connect"
+
+    # 第 4 次：熔断冷却中，直接报告，不再解析/连接
+    r = client.post("/api/v1/probe", json={"url": url})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["outcome"] == "circuit_open"
+    assert "熔断" in body["summary"]
+    hop = body["hops"][-1]
+    assert hop["outcome"] == "circuit_open"
+    assert hop["request_sent"] is False
+    assert hop["resolved_addresses"] == []
+    assert hop["connected_peer"] is None
+    assert 0 < hop["circuit_retry_after_ms"] <= 30_500
+
+    # 熔断状态可通过 /api/v1/breakers 观测
+    circuits = client.get("/api/v1/breakers").json()["circuits"]
+    entry = [c for c in circuits if c["hostname"] == "api-dead.test"][0]
+    assert entry["port"] == port
+    assert entry["state"] == "open"
+    assert entry["consecutive_failures"] >= 3
+    assert entry["retry_after_ms"] > 0
+
+
+def test_circuit_isolated_per_host(client):
+    port = _unused_port()
+    client._dns.zones["api-dead.test"] = ["127.0.0.1"]
+    for _ in range(3):
+        client.post("/api/v1/probe", json={"url": f"http://api-dead.test:{port}/"})
+    assert (
+        client.post("/api/v1/probe", json={"url": f"http://api-dead.test:{port}/"})
+        .json()["outcome"]
+        == "circuit_open"
+    )
+    # 其他目标不受影响
+    ok_port = client._http.port
+    body = client.post(
+        "/api/v1/probe", json={"url": f"http://api-good.test:{ok_port}/"}
+    ).json()
+    assert body["outcome"] == "ok"
